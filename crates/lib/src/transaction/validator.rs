@@ -15,6 +15,8 @@ use solana_sdk::{
 };
 use solana_system_interface::{instruction::SystemInstruction, program::ID as SYSTEM_PROGRAM_ID};
 
+use solana_program::program_pack::Pack;
+use spl_token_2022::extension::BaseState;
 #[allow(unused_imports)]
 use spl_token_2022::{
     extension::{
@@ -419,9 +421,31 @@ pub fn validate_token2022_account(
     Ok(actual_amount)
 }
 
+pub fn validate_token2022_mint(
+    mint_with_extensions: &StateWithExtensions<spl_token_2022::state::Mint>,
+    amount: u64,
+) -> Result<u64, KoraError> {
+    let extension_types = mint_with_extensions.get_extension_types();
+    if extension_types.is_err() || extension_types?.is_empty() {
+        let interest = std::cmp::max(
+            1,
+            (amount as u128 * 100 * 24 * 60 * 60 / 10000 / (365 * 24 * 60 * 60)) as u64,
+        );
+        return Ok(amount + interest);
+    }
+
+    // Check for extensions that might block transfers
+    check_transfer_blocking_extensions(mint_with_extensions)?;
+
+    // Calculate the actual amount after fees and interest
+    let actual_amount = calculate_actual_transfer_amount(amount, mint_with_extensions)?;
+
+    Ok(actual_amount)
+}
+
 /// Check for extensions that might block transfers entirely
-fn check_transfer_blocking_extensions(
-    account_data: &StateWithExtensions<Token2022AccountState>,
+fn check_transfer_blocking_extensions<S: BaseState + Pack>(
+    account_data: &StateWithExtensions<S>,
 ) -> Result<(), KoraError> {
     // Check if token is non-transferable
     if account_data.get_extension::<NonTransferable>().is_ok() {
@@ -439,9 +463,9 @@ fn check_transfer_blocking_extensions(
 }
 
 /// Calculate the actual amount to be received after accounting for transfer fees and interest
-fn calculate_actual_transfer_amount(
+fn calculate_actual_transfer_amount<S: BaseState + Pack>(
     amount: u64,
-    account_data: &StateWithExtensions<Token2022AccountState>,
+    account_data: &StateWithExtensions<S>,
 ) -> Result<u64, KoraError> {
     let mut actual_amount = amount;
 
@@ -498,62 +522,109 @@ async fn process_token_transfer(
     required_lamports: u64,
 ) -> Result<bool, KoraError> {
     let token_program = TokenProgram::new(token_type);
+    let instruction = spl_token::instruction::TokenInstruction::unpack(&ix.data)?;
 
-    if let Ok(amount) = token_program.decode_transfer_instruction(&ix.data) {
-        if ix.accounts.is_empty() {
-            return Ok(false);
+    match instruction {
+        spl_token::instruction::TokenInstruction::TransferChecked { amount, .. } => {
+            let mint_idx = ix.accounts[1] as usize;
+            if mint_idx >= account_keys.len() {
+                return Ok(false);
+            }
+            let mint_key = account_keys[mint_idx];
+
+            if !validation.allowed_spl_paid_tokens.contains(&mint_key.to_string()) {
+                return Ok(false);
+            }
+
+            let mint_account = rpc_client
+                .get_account(&mint_key)
+                .await
+                .map_err(|e| KoraError::RpcError(e.to_string()))?;
+
+            if mint_account.owner != token_program.program_id() {
+                return Ok(false);
+            }
+
+            let mint_with_extensions =
+                StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&mint_account.data)
+                    .map_err(|e| {
+                        KoraError::InvalidTransaction(format!("Invalid mint account: {e}"))
+                    })?;
+
+            let actual_amount = validate_token2022_mint(&mint_with_extensions, amount)?;
+
+            let lamport_value = calculate_token_value_in_lamports(
+                actual_amount,
+                &mint_key,
+                validation.price_source.clone(),
+                rpc_client,
+            )
+            .await?;
+
+            *total_lamport_value += lamport_value;
+            if *total_lamport_value >= required_lamports {
+                return Ok(true); // Payment satisfied
+            }
         }
+        spl_token::instruction::TokenInstruction::Transfer { amount, .. } => {
+            if ix.accounts.is_empty() {
+                return Ok(false);
+            }
 
-        let source_idx = ix.accounts[0] as usize;
-        if source_idx >= account_keys.len() {
-            return Ok(false);
+            let source_idx = ix.accounts[0] as usize;
+            if source_idx >= account_keys.len() {
+                return Ok(false);
+            }
+            let source_key = account_keys[source_idx];
+
+            let source_account = rpc_client
+                .get_account(&source_key)
+                .await
+                .map_err(|e| KoraError::RpcError(e.to_string()))?;
+
+            let token_state =
+                token_program.unpack_token_account(&source_account.data).map_err(|e| {
+                    KoraError::InvalidTransaction(format!("Invalid token account: {e}"))
+                })?;
+
+            if source_account.owner != token_program.program_id() {
+                return Ok(false);
+            }
+
+            // Check Token2022 specific restrictions
+            let actual_amount = if let Some(token2022_account) =
+                token_state.as_any().downcast_ref::<Token2022Account>()
+            {
+                validate_token2022_account(token2022_account, amount)?
+            } else {
+                amount
+            };
+
+            if token_state.amount() < actual_amount {
+                return Ok(false);
+            }
+
+            if !validation.allowed_spl_paid_tokens.contains(&token_state.mint().to_string()) {
+                return Ok(false);
+            }
+
+            let lamport_value = calculate_token_value_in_lamports(
+                actual_amount,
+                &token_state.mint(),
+                validation.price_source.clone(),
+                rpc_client,
+            )
+            .await?;
+
+            *total_lamport_value += lamport_value;
+            if *total_lamport_value >= required_lamports {
+                return Ok(true); // Payment satisfied
+            }
         }
-        let source_key = account_keys[source_idx];
-
-        let source_account = rpc_client
-            .get_account(&source_key)
-            .await
-            .map_err(|e| KoraError::RpcError(e.to_string()))?;
-
-        let token_state = token_program
-            .unpack_token_account(&source_account.data)
-            .map_err(|e| KoraError::InvalidTransaction(format!("Invalid token account: {e}")))?;
-
-        if source_account.owner != token_program.program_id() {
+        _ => {
             return Ok(false);
-        }
-
-        // Check Token2022 specific restrictions
-        let actual_amount = if let Some(token2022_account) =
-            token_state.as_any().downcast_ref::<Token2022Account>()
-        {
-            validate_token2022_account(token2022_account, amount)?
-        } else {
-            amount
-        };
-
-        if token_state.amount() < actual_amount {
-            return Ok(false);
-        }
-
-        if !validation.allowed_spl_paid_tokens.contains(&token_state.mint().to_string()) {
-            return Ok(false);
-        }
-
-        let lamport_value = calculate_token_value_in_lamports(
-            actual_amount,
-            &token_state.mint(),
-            validation.price_source.clone(),
-            rpc_client,
-        )
-        .await?;
-
-        *total_lamport_value += lamport_value;
-        if *total_lamport_value >= required_lamports {
-            return Ok(true); // Payment satisfied
         }
     }
-
     Ok(false)
 }
 

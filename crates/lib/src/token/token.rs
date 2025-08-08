@@ -10,8 +10,9 @@ use spl_associated_token_account::{
 };
 use spl_token::{
     self,
-    state::{Account as TokenAccountState, AccountState, Mint as MintState},
+    state::{Account as TokenAccountState, AccountState},
 };
+use spl_token_2022::extension::StateWithExtensions;
 
 #[derive(Debug)]
 pub struct TokenAccount {
@@ -152,7 +153,7 @@ impl TokenInterface for TokenProgram {
         &self,
         mint_data: &[u8],
     ) -> Result<u8, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(MintState::unpack(mint_data)?.decimals)
+        Ok(StateWithExtensions::<spl_token_2022::state::Mint>::unpack(mint_data)?.base.decimals)
     }
 
     fn decode_transfer_instruction(
