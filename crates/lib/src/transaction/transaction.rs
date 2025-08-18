@@ -14,8 +14,9 @@ use crate::{
     config::ValidationConfig, error::KoraError, get_signer,
     transaction::validator::TransactionValidator, Signer as _,
 };
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{engine::general_purpose::STANDARD, prelude::BASE64_STANDARD, Engine as _};
 use solana_address_lookup_table_interface::state::AddressLookupTable;
+use solana_client::{rpc_request::RpcRequest, rpc_response::Response};
 
 pub trait VersionedTransactionExt {
     fn get_all_account_keys(&self) -> Vec<Pubkey>;
@@ -94,11 +95,16 @@ pub async fn get_estimate_fee(
     rpc_client: &RpcClient,
     message: &VersionedMessage,
 ) -> Result<u64, KoraError> {
-    match message {
-        VersionedMessage::Legacy(message) => rpc_client.get_fee_for_message(message).await,
-        VersionedMessage::V0(message) => rpc_client.get_fee_for_message(message).await,
-    }
-    .map_err(|e| KoraError::RpcError(e.to_string()))
+    let serialized = message.serialize();
+    let encoded = BASE64_STANDARD.encode(serialized);
+    let result = rpc_client
+        .send::<Response<Option<u64>>>(
+            RpcRequest::GetFeeForMessage,
+            serde_json::json!([encoded, rpc_client.commitment()]),
+        )
+        .await
+        .map_err(|e| KoraError::RpcError(e.to_string()))?;
+    result.value.ok_or(KoraError::RpcError("Invalid blockhash".to_string()))
 }
 
 pub fn uncompile_instructions(

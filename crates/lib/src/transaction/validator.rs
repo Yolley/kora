@@ -526,13 +526,19 @@ async fn process_token_transfer(
 
     match instruction {
         spl_token::instruction::TokenInstruction::TransferChecked { amount, .. } => {
+            if ix.accounts.is_empty() {
+                return Ok(false);
+            }
+
             let mint_idx = ix.accounts[1] as usize;
             if mint_idx >= account_keys.len() {
                 return Ok(false);
             }
             let mint_key = account_keys[mint_idx];
 
-            if !validation.allowed_spl_paid_tokens.contains(&mint_key.to_string()) {
+            if validation.allowed_spl_paid_tokens.len() > 0
+                && !validation.allowed_spl_paid_tokens.contains(&mint_key.to_string())
+            {
                 return Ok(false);
             }
 
@@ -604,7 +610,9 @@ async fn process_token_transfer(
                 return Ok(false);
             }
 
-            if !validation.allowed_spl_paid_tokens.contains(&token_state.mint().to_string()) {
+            if validation.allowed_spl_paid_tokens.len() > 0
+                && !validation.allowed_spl_paid_tokens.contains(&token_state.mint().to_string())
+            {
                 return Ok(false);
             }
 
